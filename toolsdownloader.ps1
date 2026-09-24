@@ -49,6 +49,7 @@ $Groups = [ordered]@{
         'https://github.com/Orbdiff/AmcacheParser/releases/download/v1.0/AmcacheParser.exe'
         'https://github.com/Orbdiff/UserAssistView/releases/download/v1.0/UserAssistView.exe'
         'https://github.com/Orbdiff/USBDetector/releases/download/v1.1/USBDetector.exe'
+        'https://github.com/Orbdiff/PFTrace/releases/download/v1.0.1/PFTrace.exe'
     )
     'Tonynoh' = @(
         'https://github.com/MeowTonynoh/MeowClientFucker/releases/download/V1.1/MeowClientFucker.exe'
@@ -61,7 +62,6 @@ $Groups = [ordered]@{
     )
     'Nirsoft' = @(
         'https://www.nirsoft.net/utils/lastactivityview.zip'
-        'https://www.nirsoft.net/utils/alternatestreamview-x64.zip'
         'https://www.nirsoft.net/utils/networkusageview-x64.zip'
     )
     'Generic Tools' = @(

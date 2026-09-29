@@ -76,7 +76,6 @@ $Groups = [ordered]@{
         'https://mh-nexus.de/downloads/HxDPortableSetup.zip'
         'https://github.com/hasherezade/hollows_hunter/releases/download/v0.4.1.1/hollows_hunter64.exe'
         'https://github.com/Sorted1/StormSS-Fuser-Finder/releases/download/Main/Storm.Fuser.Finder.zip'
-        'https://www.dropbox.com/scl/fi/x6tt742b1kiip1vmpv1oi/DumpIt.exe?rlkey=bfjuxczigia98jlyfirmmvlk3&st=3vdg9cy9&dl=0'
     )
     'Eric Zimmerman' = @(
         'https://download.ericzimmermanstools.com/net9/SrumECmd.zip'

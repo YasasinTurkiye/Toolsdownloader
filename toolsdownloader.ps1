@@ -1,3 +1,5 @@
+#Requires -Version 7.0
+
 [CmdletBinding()]
 param()
 
@@ -31,6 +33,8 @@ $White       = "${e}[38;2;245;245;245m"
 $Grey        = "${e}[38;2;190;190;190m"
 $Gray        = "${e}[38;2;125;125;125m"
 $SpeedyWhite = "${e}[38;2;255;255;255m"
+$Orange      = $Grey
+$DkOrange    = $Gray
 
 $Green       = "${e}[38;2;80;220;80m"
 $Red         = "${e}[91m"
@@ -50,6 +54,7 @@ $Groups = [ordered]@{
         'https://github.com/Orbdiff/UserAssistView/releases/download/v1.0/UserAssistView.exe'
         'https://github.com/Orbdiff/USBDetector/releases/download/v1.1/USBDetector.exe'
         'https://github.com/Orbdiff/PFTrace/releases/download/v1.0.1/PFTrace.exe'
+        'https://github.com/Orbdiff/JARParser/releases/download/v1.2/JARParser.exe'
     )
     'Tonynoh' = @(
         'https://github.com/MeowTonynoh/MeowClientFucker/releases/download/V1.1/MeowClientFucker.exe'
@@ -73,22 +78,18 @@ $Groups = [ordered]@{
         'https://github.com/horsicq/DIE-engine/releases/download/3.10/die_win64_portable_3.10_x64.zip'
         'https://github.com/deathmarine/Luyten/releases/download/v0.5.4_Rebuilt_with_Latest_depenencies/luyten-0.5.4.exe'
         'https://github.com/zedoonvm1/MarsPixelDumpAnalyzer/releases/download/Dev/MarsPixelDumpAnalyzer.exe'
-        'https://mh-nexus.de/downloads/HxDPortableSetup.zip'
         'https://github.com/hasherezade/hollows_hunter/releases/download/v0.4.1.1/hollows_hunter64.exe'
         'https://github.com/Sorted1/StormSS-Fuser-Finder/releases/download/Main/Storm.Fuser.Finder.zip'
+        'https://github.com/praiselily/Siege/releases/download/Scanner/Siege.exe'
+        'https://github.com/piespeas/MSC-Event-Viewer/releases/download/BETA/Event.Viewer.MSC.exe'
     )
     'Eric Zimmerman' = @(
         'https://download.ericzimmermanstools.com/net9/SrumECmd.zip'
         'https://download.ericzimmermanstools.com/net9/MFTECmd.zip'
         'https://download.ericzimmermanstools.com/net9/TimelineExplorer.zip'
-        'https://download.ericzimmermanstools.com/net9/RegistryExplorer.zip'
     )
     'Detect' = @(
         'https://detect.ac/tool/ToolsDownloader++'
-    )
-    'MSC' = @(
-        'https://github.com/piespeas/MSC-Event-Viewer/releases/download/BETA/Event.Viewer.MSC.exe'
-
     )
 }
 
@@ -100,156 +101,278 @@ function Get-NextSSFolder {
     return "C:\ss$i"
 }
 
-function Get-FilenameFromUrl {
-    param(
-        [string]$Url,
-        [System.Net.Http.HttpResponseMessage]$Response = $null
-    )
+# ── Native download engine ────────────────────────────────────────────────────
+# Compiled once. Everything per file (name resolving, unique path, download, retries,
+# zip extract) runs as a .NET async task: no runspace/thread-job startup cost per file.
+#  - files >= 8 MB with Accept-Ranges are fetched as 4 parallel ranges into one preallocated file
+#  - streams are fully async, unbuffered FileStream writes, 1 MB copy buffer
+$FastDlSource = @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using Microsoft.Win32.SafeHandles;
 
-    # 1. Prefer Content-Disposition header if available
-    if ($Response -and $Response.Content.Headers.ContentDisposition -and -not [string]::IsNullOrWhiteSpace($Response.Content.Headers.ContentDisposition.FileName)) {
-        return $Response.Content.Headers.ContentDisposition.FileName.Trim('"')
+public static class FastDl
+{
+    public sealed class Result { public string Url; public string Name; public bool Ok; }
+
+    const long SegMin = 8L * 1024 * 1024;
+    const int  Segs   = 4;
+
+    public static Task<Result> Run(HttpClient c, string url, string dir, int buf)
+    {
+        return Task.Run(() => Do(c, url, dir, buf));
     }
 
-    # 2. Check final redirected URI
-    if ($Response -and $Response.RequestMessage -and $Response.RequestMessage.RequestUri) {
-        $finalPath = $Response.RequestMessage.RequestUri.AbsolutePath
-        $finalName = [System.Uri]::UnescapeDataString([System.IO.Path]::GetFileName($finalPath))
-        if (-not [string]::IsNullOrWhiteSpace($finalName) -and [System.IO.Path]::HasExtension($finalName)) {
-            return $finalName
+    static string Clean(string n)
+    {
+        foreach (char ch in Path.GetInvalidFileNameChars()) n = n.Replace(ch, '_');
+        return n;
+    }
+
+    static string NameFromUrl(string url, HttpResponseMessage r)
+    {
+        if (r != null)
+        {
+            var cd = r.Content.Headers.ContentDisposition;
+            if (cd != null && !string.IsNullOrWhiteSpace(cd.FileName)) return Clean(cd.FileName.Trim('"'));
+            var uri = r.RequestMessage != null ? r.RequestMessage.RequestUri : null;
+            if (uri != null)
+            {
+                string n = Uri.UnescapeDataString(Path.GetFileName(uri.AbsolutePath));
+                if (!string.IsNullOrWhiteSpace(n) && Path.HasExtension(n)) return Clean(n);
+            }
+        }
+        if (Regex.IsMatch(url, @"/ToolsDownloader\+\+$")) return "ToolsDownloader++.exe";
+        return Clean(Uri.UnescapeDataString(Path.GetFileName(new Uri(url).AbsolutePath)));
+    }
+
+    static async Task<Result> Do(HttpClient c, string url, string dir, int buf)
+    {
+        string name;
+        try { name = NameFromUrl(url, null); } catch { name = url; }
+        if (string.IsNullOrWhiteSpace(name)) return new Result { Url = url, Name = url, Ok = false };
+
+        for (int attempt = 1; attempt <= 3; attempt++)
+        {
+            string dest = null;        // set only once WE created the file
+            string extractDir = null;
+            bool isZip = false;
+            try
+            {
+                using (var resp = await c.GetAsync(url, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false))
+                {
+                    resp.EnsureSuccessStatusCode();
+
+                    string better = NameFromUrl(url, resp);
+                    if (!string.IsNullOrWhiteSpace(better)) name = better;
+
+                    isZip = name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase);
+                    string baseName = Path.GetFileNameWithoutExtension(name);
+                    string ext = Path.GetExtension(name);
+                    long len = resp.Content.Headers.ContentLength ?? -1;
+
+                    bool ranges = false;
+                    foreach (string u in resp.Headers.AcceptRanges)
+                        if (string.Equals(u, "bytes", StringComparison.OrdinalIgnoreCase)) ranges = true;
+                    bool seg = attempt == 1 && ranges && len >= SegMin && resp.Content.Headers.ContentEncoding.Count == 0;
+
+                    // Reserve a unique path atomically (CreateNew).
+                    FileStream fs = null;
+                    for (int n = 1; fs == null; n++)
+                    {
+                        if (n > 1000) throw new IOException("cannot allocate file name");
+                        string suf = n == 1 ? "" : "_" + n;
+                        string cand = Path.Combine(dir, baseName + suf + ext);
+                        string cdir = Path.Combine(dir, baseName + suf);
+                        if (isZip && Directory.Exists(cdir)) continue;
+                        try
+                        {
+                            fs = new FileStream(cand, new FileStreamOptions
+                            {
+                                Mode = FileMode.CreateNew,
+                                Access = FileAccess.Write,
+                                Share = FileShare.None,
+                                BufferSize = 0,
+                                Options = FileOptions.Asynchronous | FileOptions.SequentialScan,
+                                PreallocationSize = len > 0 ? len : 0
+                            });
+                            dest = cand;
+                            extractDir = cdir;
+                        }
+                        catch (IOException) when (File.Exists(cand)) { }
+                    }
+
+                    using (fs)
+                    {
+                        if (seg)
+                        {
+                            resp.Dispose();
+                            await Segmented(c, url, fs, len, buf).ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            using (var ns = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false))
+                                await ns.CopyToAsync(fs, buf).ConfigureAwait(false);
+                        }
+                    }
+                }
+
+                if (isZip)
+                {
+                    string z = dest, d = extractDir;
+                    await Task.Run(() => Extract(z, d)).ConfigureAwait(false);
+                    File.Delete(dest);
+                    dest = null;
+                }
+                return new Result { Url = url, Name = name, Ok = true };
+            }
+            catch
+            {
+                try { if (dest != null && File.Exists(dest)) File.Delete(dest); } catch { }
+                try { if (isZip && extractDir != null && Directory.Exists(extractDir)) Directory.Delete(extractDir, true); } catch { }
+                if (attempt < 3) await Task.Delay(400 * attempt).ConfigureAwait(false);
+            }
+        }
+        return new Result { Url = url, Name = name, Ok = false };
+    }
+
+    static async Task Segmented(HttpClient c, string url, FileStream fs, long len, int buf)
+    {
+        fs.SetLength(len);
+        SafeFileHandle h = fs.SafeFileHandle;
+        long chunk = (len + Segs - 1) / Segs;
+        var tasks = new List<Task<long>>();
+        for (int i = 0; i < Segs; i++)
+        {
+            long from = i * chunk;
+            long to = Math.Min(len, from + chunk) - 1;
+            if (from > to) break;
+            tasks.Add(Seg(c, url, h, from, to, buf));
+        }
+        long total = 0;
+        foreach (long t in await Task.WhenAll(tasks).ConfigureAwait(false)) total += t;
+        if (total != len) throw new IOException("size mismatch");
+    }
+
+    static async Task<long> Seg(HttpClient c, string url, SafeFileHandle h, long from, long to, int buf)
+    {
+        using (var req = new HttpRequestMessage(HttpMethod.Get, url))
+        {
+            req.Headers.Range = new RangeHeaderValue(from, to);
+            using (var r = await c.SendAsync(req, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false))
+            {
+                if (r.StatusCode != HttpStatusCode.PartialContent) throw new IOException("range not honoured");
+                using (var s = await r.Content.ReadAsStreamAsync().ConfigureAwait(false))
+                {
+                    var b = new byte[buf];
+                    long pos = from;
+                    int n;
+                    while ((n = await s.ReadAsync(b, 0, b.Length).ConfigureAwait(false)) > 0)
+                    {
+                        await RandomAccess.WriteAsync(h, new ReadOnlyMemory<byte>(b, 0, n), pos).ConfigureAwait(false);
+                        pos += n;
+                    }
+                    return pos - from;
+                }
+            }
         }
     }
 
-    # 3. Handle known URLs without file extensions
-    if ($Url -match '/ToolsDownloader\+\+$') {
-        return 'ToolsDownloader++.exe'
+    static void Extract(string zip, string dir)
+    {
+        try { ZipFile.ExtractToDirectory(zip, dir); return; } catch { }
+
+        // Fallback for archives with non-standard entries: extract entry by entry.
+        if (Directory.Exists(dir)) Directory.Delete(dir, true);
+        Directory.CreateDirectory(dir);
+        string root = Path.GetFullPath(dir + Path.DirectorySeparatorChar);
+        using (var a = ZipFile.OpenRead(zip))
+        {
+            foreach (var e in a.Entries)
+            {
+                string p = Path.GetFullPath(Path.Combine(dir, e.FullName));
+                if (!p.StartsWith(root, StringComparison.OrdinalIgnoreCase)) continue;
+                if (e.FullName.EndsWith("/") || e.FullName.EndsWith("\\")) { Directory.CreateDirectory(p); continue; }
+                Directory.CreateDirectory(Path.GetDirectoryName(p));
+                e.ExtractToFile(p, true);
+            }
+        }
     }
-
-    # 4. Extract from URL path
-    $path = ([System.Uri]$Url).AbsolutePath
-    return [System.Uri]::UnescapeDataString([System.IO.Path]::GetFileName($path))
 }
+'@
 
-# ── Fast sequential HTTP client ───────────────────────────────────────────────
-$HttpHandler = [System.Net.Http.HttpClientHandler]::new()
-try {
-    $HttpHandler.AutomaticDecompression = [System.Net.DecompressionMethods]'GZip, Deflate'
-} catch {
-    $HttpHandler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip
-}
+Add-Type -TypeDefinition $FastDlSource -ReferencedAssemblies @(
+    'System.Net.Http', 'System.Net.Primitives', 'System.IO.Compression', 'System.IO.Compression.ZipFile',
+    'System.Collections', 'System.Text.RegularExpressions', 'System.Threading.Tasks', 'System.Memory',
+    'System.Runtime', 'System.Runtime.InteropServices', 'Microsoft.Win32.Primitives', 'System.Linq'
+)
 
-# Reuse the same connection/client across all sequential downloads (HTTP Keep-Alive pool)
+# ── Shared HTTP client (HTTP/2, big flow-control window, one pool) ────────────
+$HttpHandler = [System.Net.Http.SocketsHttpHandler]::new()
+$HttpHandler.PooledConnectionLifetime       = [TimeSpan]::FromMinutes(5)
+$HttpHandler.EnableMultipleHttp2Connections = $true
+$HttpHandler.AutomaticDecompression         = [System.Net.DecompressionMethods]'GZip, Deflate, Brotli'
+$HttpHandler.ConnectTimeout                 = [TimeSpan]::FromSeconds(15)
+$HttpHandler.InitialHttp2StreamWindowSize   = 16MB
+$HttpHandler.MaxConnectionsPerServer        = 64
+
 $HttpClient = [System.Net.Http.HttpClient]::new($HttpHandler)
 $HttpClient.Timeout = [TimeSpan]::FromMinutes(10)
+$HttpClient.DefaultRequestVersion = [Version]'2.0'
+$HttpClient.DefaultVersionPolicy  = [System.Net.Http.HttpVersionPolicy]::RequestVersionOrLower
 $HttpClient.DefaultRequestHeaders.UserAgent.ParseAdd('Speedyxx-ToolsDownloader/2.0')
-$HttpClient.DefaultRequestHeaders.ConnectionClose = $false
 
-# 256 KB buffer for high-throughput stream writes
-$BufferSize = 262144
+# 1 MB copy buffer
+$BufferSize = 1048576
 
-function Invoke-FileDownload {
+# Pre-warm DNS + TCP + TLS for every host while the user reads the menu.
+$warmHosts = @($Groups.Values | ForEach-Object { $_ } | ForEach-Object { ([System.Uri]$_).GetLeftPart('Authority') }) +
+             'https://objects.githubusercontent.com', 'https://release-assets.githubusercontent.com' | Select-Object -Unique
+foreach ($h in $warmHosts) {
+    try {
+        $req = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Head, $h)
+        [void]$HttpClient.SendAsync($req, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead)
+    } catch {}
+}
+
+# ── Group downloader: all files of ONE group at once; caller runs groups sequentially ──
+function Invoke-GroupDownload {
     param(
-        [string]$Url,
+        [string[]]$Urls,
         [string]$GroupFolder,
         [System.Collections.Generic.List[string]]$FailedList
     )
 
-    $targetFile = $null
-    $tempZip    = $null
-
-    $filename = Get-FilenameFromUrl -Url $Url
-    if ([string]::IsNullOrWhiteSpace($filename)) {
-        Write-Host "    ${Red}✗ URL has no downloadable filename: $Url${Reset}"
-        $FailedList.Add($Url)
-        return
+    $tasks = [System.Collections.Generic.List[System.Threading.Tasks.Task]]::new()
+    $urlOf = @{}
+    foreach ($u in $Urls) {
+        $t = [FastDl]::Run($HttpClient, $u, $GroupFolder, $BufferSize)
+        $urlOf[$t.Id] = $u
+        $tasks.Add($t)
     }
 
-    Write-Host "    ${DkOrange}↓ ${Orange}$filename${Reset} " -NoNewline
-
-    try {
-        # Stream response headers without buffering entire payload into RAM
-        $response = $HttpClient.GetAsync($Url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
-        [void]$response.EnsureSuccessStatusCode()
-
-        $betterName = Get-FilenameFromUrl -Url $Url -Response $response
-        if (-not [string]::IsNullOrWhiteSpace($betterName)) {
-            $filename = $betterName
-        }
-
-        $isZip = $filename -match '\.zip$'
-
-        if ($isZip) {
-            $baseName   = [System.IO.Path]::GetFileNameWithoutExtension($filename)
-            $tempZip    = Join-Path $GroupFolder $filename
-            $extractDir = Join-Path $GroupFolder $baseName
-
-            # Avoid overwriting another tool with the same filename.
-            $n = 2
-            while ((Test-Path $tempZip) -or (Test-Path $extractDir)) {
-                $tempZip    = Join-Path $GroupFolder ("{0}_{1}.zip" -f $baseName, $n)
-                $extractDir = Join-Path $GroupFolder ("{0}_{1}" -f $baseName, $n)
-                $n++
-            }
-
-            # Direct native stream copy to disk
-            $fileStream = [System.IO.FileStream]::new($tempZip, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None, $BufferSize, [System.IO.FileOptions]::SequentialScan)
-            try {
-                $netStream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-                $netStream.CopyTo($fileStream, $BufferSize)
-            } finally {
-                $fileStream.Dispose()
-                if ($netStream) { $netStream.Dispose() }
-                $response.Dispose()
-            }
-
-            # Fast native CLR zip extraction (orders of magnitude faster than Expand-Archive)
-            try {
-                [System.IO.Compression.ZipFile]::ExtractToDirectory($tempZip, $extractDir)
-                Remove-Item -Path $tempZip -Force -ErrorAction SilentlyContinue
-                Write-Host "${Green}✓${Reset}"
-            } catch {
-                # Fallback to Expand-Archive if ZipFile fails on non-standard entries
-                try {
-                    $null = New-Item -ItemType Directory -Path $extractDir -Force
-                    Expand-Archive -Path $tempZip -DestinationPath $extractDir -Force
-                    Remove-Item -Path $tempZip -Force -ErrorAction SilentlyContinue
-                    Write-Host "${Green}✓${Reset}"
-                } catch {
-                    Write-Host "${Red}✗${Reset}"
-                    $FailedList.Add($Url)
-                    if (Test-Path $tempZip) { Remove-Item -Path $tempZip -Force -ErrorAction SilentlyContinue }
-                }
-            }
+    # Print each result the moment its file finishes.
+    while ($tasks.Count -gt 0) {
+        $i = [System.Threading.Tasks.Task]::WaitAny($tasks.ToArray())
+        $t = $tasks[$i]
+        $tasks.RemoveAt($i)
+        $url = $urlOf[$t.Id]
+        $r = $null
+        try { $r = $t.Result } catch {}
+        if ($r -and $r.Ok) {
+            Write-Host "    ${DkOrange}↓ ${Orange}$($r.Name)${Reset} ${Green}✓${Reset}"
         } else {
-            $baseName  = [System.IO.Path]::GetFileNameWithoutExtension($filename)
-            $extension = [System.IO.Path]::GetExtension($filename)
-            $destPath  = Join-Path $GroupFolder $filename
-
-            # Avoid overwriting another tool with the same filename.
-            $n = 2
-            while (Test-Path $destPath) {
-                $destPath = Join-Path $GroupFolder ("{0}_{1}{2}" -f $baseName, $n, $extension)
-                $n++
-            }
-            $targetFile = $destPath
-
-            # Direct native stream copy to disk
-            $fileStream = [System.IO.FileStream]::new($destPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None, $BufferSize, [System.IO.FileOptions]::SequentialScan)
-            try {
-                $netStream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-                $netStream.CopyTo($fileStream, $BufferSize)
-                Write-Host "${Green}✓${Reset}"
-            } finally {
-                $fileStream.Dispose()
-                if ($netStream) { $netStream.Dispose() }
-                $response.Dispose()
-            }
+            $name = if ($r) { $r.Name } else { $url }
+            Write-Host "    ${DkOrange}↓ ${Orange}$name${Reset} ${Red}✗${Reset}"
+            $FailedList.Add($url)
         }
-    } catch {
-        Write-Host "${Red}✗${Reset}"
-        $FailedList.Add($Url)
-        if ($targetFile -and (Test-Path $targetFile)) { Remove-Item -Path $targetFile -Force -ErrorAction SilentlyContinue }
-        if ($tempZip -and (Test-Path $tempZip))       { Remove-Item -Path $tempZip -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -265,11 +388,11 @@ function Show-Banner {
     Write-Host " ⠀⠀⠀⠀⠀⠀✧⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀✦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀"
     Write-Host "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⋆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀✧⠀⠀"
     Write-Host "⠀⠀⠀⠀⠀⠀⠀⠀⠀✧⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀✦⠀⠀"
-    Write-Host " ⠀⠀⠀⠀⋆⠀⠀⠀⠀⠀⠀⠀⠀⠀✦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀"⠀
+    Write-Host " ⠀⠀⠀⠀⋆⠀⠀⠀⠀⠀⠀⠀⠀⠀✦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀"
     Write-Host "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀✧⠀⠀⠀⠀⋆⠀⠀⠀⠀⠀⠀⠀⠀⠀"
     Write-Host "⠀⠀ ⠀✦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀✧⠀⠀⠀⠀"
     Write-Host "⠀⠀⠀⠀⋆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀✦⠀⠀"
-     Write-Host ""
+    Write-Host ""
     # STARS wordmark
     Write-Host "${White}${Grey} ███████╗████████╗ █████╗ ██████╗ ███████╗ ${Reset}"
     Write-Host "${White}${Grey} ██╔════╝╚══██╔══╝██╔══██╗██╔══██╗██╔════╝ ${Reset}"
@@ -377,7 +500,7 @@ if (-not (Get-Command -Name 'Add-MpPreference' -ErrorAction SilentlyContinue)) {
     }
 }
 
-# ── Download ──────────────────────────────────────────────────────────────────
+# ── Download (one group after the other, files inside a group all at once) ────
 $failed = [System.Collections.Generic.List[string]]::new()
 
 foreach ($groupName in $selectedNames) {
@@ -389,10 +512,11 @@ foreach ($groupName in $selectedNames) {
     Write-Host "  ${White}━━━ $groupName ${Gray}($($urls.Count) tools)${Reset}"
     Write-Host ""
 
-    foreach ($url in $urls) {
-        Invoke-FileDownload -Url $url -GroupFolder $groupDir -FailedList $failed
-    }
+    Invoke-GroupDownload -Urls $urls -GroupFolder $groupDir -FailedList $failed
 }
+
+$HttpClient.Dispose()
+$HttpHandler.Dispose()
 
 # ── Rename ToolsDownloader++ ───────────────────────────────────────────────────
 $toolsDownloader = Get-ChildItem -Path $ssFolder `

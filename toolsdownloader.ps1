@@ -67,7 +67,6 @@ $Groups = [ordered]@{
     )
     'Nirsoft' = @(
         'https://www.nirsoft.net/utils/lastactivityview.zip'
-        'https://www.nirsoft.net/utils/networkusageview-x64.zip'
     )
     'Generic Tools' = @(
         'https://github.com/winsiderss/si-builds/releases/download/4.0.26245.218/systeminformer-build-canary-setup.exe'

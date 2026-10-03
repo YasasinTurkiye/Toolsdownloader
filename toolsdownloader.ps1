@@ -1,7 +1,8 @@
-#Requires -Version 7.0
-
 [CmdletBinding()]
 param()
+
+# Works on Windows PowerShell 5.1 and PowerShell 7+ (#Requires is ignored by iex, so no #Requires here)
+$IsPS7 = $PSVersionTable.PSVersion.Major -ge 7
 
 # ── Privilege check ───────────────────────────────────────────────────────────
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -101,10 +102,11 @@ function Get-NextSSFolder {
 }
 
 # ── Native download engine ────────────────────────────────────────────────────
-# Compiled once. Everything per file (name resolving, unique path, download, retries,
-# zip extract) runs as a .NET async task: no runspace/thread-job startup cost per file.
+# Compiled once. Source is C# 5 compatible so it builds on Windows PowerShell 5.1
+# (.NET Framework) and on PowerShell 7 (.NET). Per file (name resolving, unique path,
+# download, retries, zip extract) runs as a .NET async task: no runspace cost per file.
 #  - files >= 8 MB with Accept-Ranges are fetched as 4 parallel ranges into one preallocated file
-#  - streams are fully async, unbuffered FileStream writes, 1 MB copy buffer
+#  - streams are fully async, 1 MB copy buffer
 $FastDlSource = @'
 using System;
 using System.Collections.Generic;
@@ -115,7 +117,6 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
-using Microsoft.Win32.SafeHandles;
 
 public static class FastDl
 {
@@ -175,7 +176,7 @@ public static class FastDl
                     isZip = name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase);
                     string baseName = Path.GetFileNameWithoutExtension(name);
                     string ext = Path.GetExtension(name);
-                    long len = resp.Content.Headers.ContentLength ?? -1;
+                    long len = resp.Content.Headers.ContentLength.HasValue ? resp.Content.Headers.ContentLength.Value : -1;
 
                     bool ranges = false;
                     foreach (string u in resp.Headers.AcceptRanges)
@@ -193,32 +194,30 @@ public static class FastDl
                         if (isZip && Directory.Exists(cdir)) continue;
                         try
                         {
-                            fs = new FileStream(cand, new FileStreamOptions
-                            {
-                                Mode = FileMode.CreateNew,
-                                Access = FileAccess.Write,
-                                Share = FileShare.None,
-                                BufferSize = 0,
-                                Options = FileOptions.Asynchronous | FileOptions.SequentialScan,
-                                PreallocationSize = len > 0 ? len : 0
-                            });
+                            fs = new FileStream(cand, FileMode.CreateNew, FileAccess.Write, FileShare.ReadWrite,
+                                                4096, FileOptions.Asynchronous | FileOptions.SequentialScan);
                             dest = cand;
                             extractDir = cdir;
                         }
-                        catch (IOException) when (File.Exists(cand)) { }
+                        catch (IOException)
+                        {
+                            if (!File.Exists(cand)) throw;
+                        }
                     }
 
                     using (fs)
                     {
+                        if (len > 0) fs.SetLength(len);   // preallocate
                         if (seg)
                         {
                             resp.Dispose();
-                            await Segmented(c, url, fs, len, buf).ConfigureAwait(false);
+                            await Segmented(c, url, dest, len, buf).ConfigureAwait(false);
                         }
                         else
                         {
                             using (var ns = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false))
                                 await ns.CopyToAsync(fs, buf).ConfigureAwait(false);
+                            if (len > 0 && fs.Length != fs.Position) fs.SetLength(fs.Position);
                         }
                     }
                 }
@@ -236,16 +235,14 @@ public static class FastDl
             {
                 try { if (dest != null && File.Exists(dest)) File.Delete(dest); } catch { }
                 try { if (isZip && extractDir != null && Directory.Exists(extractDir)) Directory.Delete(extractDir, true); } catch { }
-                if (attempt < 3) await Task.Delay(400 * attempt).ConfigureAwait(false);
             }
+            if (attempt < 3) await Task.Delay(400 * attempt).ConfigureAwait(false);
         }
         return new Result { Url = url, Name = name, Ok = false };
     }
 
-    static async Task Segmented(HttpClient c, string url, FileStream fs, long len, int buf)
+    static async Task Segmented(HttpClient c, string url, string path, long len, int buf)
     {
-        fs.SetLength(len);
-        SafeFileHandle h = fs.SafeFileHandle;
         long chunk = (len + Segs - 1) / Segs;
         var tasks = new List<Task<long>>();
         for (int i = 0; i < Segs; i++)
@@ -253,14 +250,14 @@ public static class FastDl
             long from = i * chunk;
             long to = Math.Min(len, from + chunk) - 1;
             if (from > to) break;
-            tasks.Add(Seg(c, url, h, from, to, buf));
+            tasks.Add(Seg(c, url, path, from, to, buf));
         }
         long total = 0;
         foreach (long t in await Task.WhenAll(tasks).ConfigureAwait(false)) total += t;
         if (total != len) throw new IOException("size mismatch");
     }
 
-    static async Task<long> Seg(HttpClient c, string url, SafeFileHandle h, long from, long to, int buf)
+    static async Task<long> Seg(HttpClient c, string url, string path, long from, long to, int buf)
     {
         using (var req = new HttpRequestMessage(HttpMethod.Get, url))
         {
@@ -269,13 +266,16 @@ public static class FastDl
             {
                 if (r.StatusCode != HttpStatusCode.PartialContent) throw new IOException("range not honoured");
                 using (var s = await r.Content.ReadAsStreamAsync().ConfigureAwait(false))
+                using (var o = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite,
+                                              4096, FileOptions.Asynchronous))
                 {
+                    o.Seek(from, SeekOrigin.Begin);
                     var b = new byte[buf];
                     long pos = from;
                     int n;
                     while ((n = await s.ReadAsync(b, 0, b.Length).ConfigureAwait(false)) > 0)
                     {
-                        await RandomAccess.WriteAsync(h, new ReadOnlyMemory<byte>(b, 0, n), pos).ConfigureAwait(false);
+                        await o.WriteAsync(b, 0, n).ConfigureAwait(false);
                         pos += n;
                     }
                     return pos - from;
@@ -307,25 +307,44 @@ public static class FastDl
 }
 '@
 
-Add-Type -TypeDefinition $FastDlSource -ReferencedAssemblies @(
-    'System.Net.Http', 'System.Net.Primitives', 'System.IO.Compression', 'System.IO.Compression.ZipFile',
-    'System.Collections', 'System.Text.RegularExpressions', 'System.Threading.Tasks', 'System.Memory',
-    'System.Runtime', 'System.Runtime.InteropServices', 'Microsoft.Win32.Primitives', 'System.Linq'
-)
+if ($IsPS7) {
+    $refs = @(
+        'System.Net.Http', 'System.Net.Primitives', 'System.IO.Compression', 'System.IO.Compression.ZipFile',
+        'System.Collections', 'System.Text.RegularExpressions', 'System.Threading.Tasks', 'System.Memory',
+        'System.Runtime', 'System.Runtime.InteropServices', 'Microsoft.Win32.Primitives', 'System.Linq'
+    )
+} else {
+    $refs = @('System.Net.Http', 'System.IO.Compression', 'System.IO.Compression.FileSystem')
+}
 
-# ── Shared HTTP client (HTTP/2, big flow-control window, one pool) ────────────
-$HttpHandler = [System.Net.Http.SocketsHttpHandler]::new()
-$HttpHandler.PooledConnectionLifetime       = [TimeSpan]::FromMinutes(5)
-$HttpHandler.EnableMultipleHttp2Connections = $true
-$HttpHandler.AutomaticDecompression         = [System.Net.DecompressionMethods]'GZip, Deflate, Brotli'
-$HttpHandler.ConnectTimeout                 = [TimeSpan]::FromSeconds(15)
-$HttpHandler.InitialHttp2StreamWindowSize   = 16MB
-$HttpHandler.MaxConnectionsPerServer        = 64
+try {
+    Add-Type -TypeDefinition $FastDlSource -ReferencedAssemblies $refs -ErrorAction Stop
+} catch {
+    Write-Host "  Failed to compile download engine: $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
+}
 
-$HttpClient = [System.Net.Http.HttpClient]::new($HttpHandler)
+# ── Shared HTTP client (one pool; HTTP/2 + Brotli on PS7, HttpClientHandler on 5.1) ──
+if ($IsPS7) {
+    $HttpHandler = [System.Net.Http.SocketsHttpHandler]::new()
+    $HttpHandler.PooledConnectionLifetime       = [TimeSpan]::FromMinutes(5)
+    $HttpHandler.EnableMultipleHttp2Connections = $true
+    $HttpHandler.AutomaticDecompression         = [System.Net.DecompressionMethods]'GZip, Deflate, Brotli'
+    $HttpHandler.ConnectTimeout                 = [TimeSpan]::FromSeconds(15)
+    $HttpHandler.InitialHttp2StreamWindowSize   = 16MB
+    $HttpHandler.MaxConnectionsPerServer        = 64
+} else {
+    $HttpHandler = New-Object System.Net.Http.HttpClientHandler
+    $HttpHandler.AutomaticDecompression = [System.Net.DecompressionMethods]'GZip, Deflate'
+    $HttpHandler.AllowAutoRedirect      = $true
+}
+
+$HttpClient = New-Object System.Net.Http.HttpClient($HttpHandler)
 $HttpClient.Timeout = [TimeSpan]::FromMinutes(10)
-$HttpClient.DefaultRequestVersion = [Version]'2.0'
-$HttpClient.DefaultVersionPolicy  = [System.Net.Http.HttpVersionPolicy]::RequestVersionOrLower
+if ($IsPS7) {
+    $HttpClient.DefaultRequestVersion = [Version]'2.0'
+    $HttpClient.DefaultVersionPolicy  = [System.Net.Http.HttpVersionPolicy]::RequestVersionOrLower
+}
 $HttpClient.DefaultRequestHeaders.UserAgent.ParseAdd('Speedyxx-ToolsDownloader/2.0')
 
 # 1 MB copy buffer
@@ -336,7 +355,7 @@ $warmHosts = @($Groups.Values | ForEach-Object { $_ } | ForEach-Object { ([Syste
              'https://objects.githubusercontent.com', 'https://release-assets.githubusercontent.com' | Select-Object -Unique
 foreach ($h in $warmHosts) {
     try {
-        $req = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Head, $h)
+        $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Head, $h)
         [void]$HttpClient.SendAsync($req, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead)
     } catch {}
 }
@@ -349,7 +368,7 @@ function Invoke-GroupDownload {
         [System.Collections.Generic.List[string]]$FailedList
     )
 
-    $tasks = [System.Collections.Generic.List[System.Threading.Tasks.Task]]::new()
+    $tasks = New-Object 'System.Collections.Generic.List[System.Threading.Tasks.Task]'
     $urlOf = @{}
     foreach ($u in $Urls) {
         $t = [FastDl]::Run($HttpClient, $u, $GroupFolder, $BufferSize)
@@ -378,7 +397,6 @@ function Invoke-GroupDownload {
 function Show-Banner {
     Clear-Host
 
-    $mr = $White; $mo = $Grey; $mc = $Stars; $r = $Reset
     Write-Host ""
     Write-Host "⠀⠀⠀⠀⠀⠀⠀⠀✧⠀⠀⠀⠀⠀⋆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀"
     Write-Host "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀✦⠀⠀⠀⠀⠀⠀✧⠀⠀⠀⠀⠀⠀"
@@ -500,7 +518,7 @@ if (-not (Get-Command -Name 'Add-MpPreference' -ErrorAction SilentlyContinue)) {
 }
 
 # ── Download (one group after the other, files inside a group all at once) ────
-$failed = [System.Collections.Generic.List[string]]::new()
+$failed = New-Object 'System.Collections.Generic.List[string]'
 
 foreach ($groupName in $selectedNames) {
     $urls     = $Groups[$groupName]

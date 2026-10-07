@@ -1,10 +1,8 @@
 [CmdletBinding()]
 param()
 
-# Works on Windows PowerShell 5.1 and PowerShell 7+ (#Requires is ignored by iex, so no #Requires here)
 $IsPS7 = $PSVersionTable.PSVersion.Major -ge 7
 
-# ── Privilege check ───────────────────────────────────────────────────────────
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host 'This script requires Administrator privileges.' -ForegroundColor Red
     Write-Host 'Please re-run from an elevated PowerShell session.' -ForegroundColor Yellow
@@ -13,7 +11,6 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 
 $ProgressPreference = 'SilentlyContinue'
 
-# ── Required Assemblies & Connection Optimizations ───────────────────────────
 Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
 Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
 Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
@@ -27,7 +24,6 @@ try {
 [System.Net.ServicePointManager]::Expect100Continue = $false
 [System.Net.ServicePointManager]::UseNagleAlgorithm = $false
 
-# ── ANSI palette ──────────────────────────────────────────────────────────────
 $e = [char]27
 
 $White       = "${e}[38;2;245;245;245m"
@@ -56,6 +52,8 @@ $Groups = [ordered]@{
         'https://github.com/Orbdiff/USBDetector/releases/download/v1.1/USBDetector.exe'
         'https://github.com/Orbdiff/PFTrace/releases/download/v1.0.1/PFTrace.exe'
         'https://github.com/Orbdiff/JARParser/releases/download/v1.2/JARParser.exe'
+        'https://github.com/Orbdiff/MFTParser/releases/download/v0.1/mftparser.exe'
+        'https://github.com/Orbdiff/InjGen/releases/download/fork/InjGen.exe'
     )
     'Tonynoh' = @(
         'https://github.com/MeowTonynoh/MeowClientFucker/releases/download/V1.1/MeowClientFucker.exe'
@@ -68,6 +66,7 @@ $Groups = [ordered]@{
     )
     'Nirsoft' = @(
         'https://www.nirsoft.net/utils/lastactivityview.zip'
+        'https://www.nirsoft.net/utils/clipboardic.zip'
     )
     'Generic Tools' = @(
         'https://github.com/winsiderss/si-builds/releases/download/4.0.26245.218/systeminformer-build-canary-setup.exe'
@@ -75,17 +74,17 @@ $Groups = [ordered]@{
         'https://github.com/YasasinTurkiye/AltChecker/raw/refs/heads/main/AltChecker.exe'
         'https://github.com/Inkenal/RegistryScanner/releases/download/main/RegistryScanner.exe'
         'https://github.com/Inkenal/TaskParser/releases/download/main/VigilsTaskParser.exe'
-        'https://github.com/horsicq/DIE-engine/releases/download/3.10/die_win64_portable_3.10_x64.zip'
         'https://github.com/deathmarine/Luyten/releases/download/v0.5.4_Rebuilt_with_Latest_depenencies/luyten-0.5.4.exe'
         'https://github.com/zedoonvm1/MarsPixelDumpAnalyzer/releases/download/Dev/MarsPixelDumpAnalyzer.exe'
         'https://github.com/hasherezade/hollows_hunter/releases/download/v0.4.1.1/hollows_hunter64.exe'
         'https://github.com/Sorted1/StormSS-Fuser-Finder/releases/download/Main/Storm.Fuser.Finder.zip'
         'https://github.com/praiselily/Siege/releases/download/Scanner/Siege.exe'
         'https://github.com/piespeas/MSC-Event-Viewer/releases/download/BETA/Event.Viewer.MSC.exe'
+        'https://github.com/Yamato-Security/hayabusa/releases/download/v4.1.0/hayabusa-4.1.0-win-x64.zip'
+        'https://github.com/rtfmkiesel/loldrivers-client/releases/download/v2.0.1/LOLDrivers-client_Windows_amd64.zip'
     )
     'Eric Zimmerman' = @(
         'https://download.ericzimmermanstools.com/net9/SrumECmd.zip'
-        'https://download.ericzimmermanstools.com/net9/MFTECmd.zip'
         'https://download.ericzimmermanstools.com/net9/TimelineExplorer.zip'
     )
     'Detect' = @(
@@ -101,12 +100,6 @@ function Get-NextSSFolder {
     return "C:\ss$i"
 }
 
-# ── Native download engine ────────────────────────────────────────────────────
-# Compiled once. Source is C# 5 compatible so it builds on Windows PowerShell 5.1
-# (.NET Framework) and on PowerShell 7 (.NET). Per file (name resolving, unique path,
-# download, retries, zip extract) runs as a .NET async task: no runspace cost per file.
-#  - files >= 8 MB with Accept-Ranges are fetched as 4 parallel ranges into one preallocated file
-#  - streams are fully async, 1 MB copy buffer
 $FastDlSource = @'
 using System;
 using System.Collections.Generic;
@@ -324,7 +317,6 @@ try {
     exit 1
 }
 
-# ── Shared HTTP client (one pool; HTTP/2 + Brotli on PS7, HttpClientHandler on 5.1) ──
 if ($IsPS7) {
     $HttpHandler = [System.Net.Http.SocketsHttpHandler]::new()
     $HttpHandler.PooledConnectionLifetime       = [TimeSpan]::FromMinutes(5)
@@ -347,10 +339,8 @@ if ($IsPS7) {
 }
 $HttpClient.DefaultRequestHeaders.UserAgent.ParseAdd('Speedyxx-ToolsDownloader/2.0')
 
-# 1 MB copy buffer
 $BufferSize = 1048576
 
-# Pre-warm DNS + TCP + TLS for every host while the user reads the menu.
 $warmHosts = @($Groups.Values | ForEach-Object { $_ } | ForEach-Object { ([System.Uri]$_).GetLeftPart('Authority') }) +
              'https://objects.githubusercontent.com', 'https://release-assets.githubusercontent.com' | Select-Object -Unique
 foreach ($h in $warmHosts) {
@@ -360,7 +350,6 @@ foreach ($h in $warmHosts) {
     } catch {}
 }
 
-# ── Group downloader: all files of ONE group at once; caller runs groups sequentially ──
 function Invoke-GroupDownload {
     param(
         [string[]]$Urls,
@@ -376,7 +365,6 @@ function Invoke-GroupDownload {
         $tasks.Add($t)
     }
 
-    # Print each result the moment its file finishes.
     while ($tasks.Count -gt 0) {
         $i = [System.Threading.Tasks.Task]::WaitAny($tasks.ToArray())
         $t = $tasks[$i]
@@ -396,21 +384,7 @@ function Invoke-GroupDownload {
 
 function Show-Banner {
     Clear-Host
-
-    Write-Host ""
-    Write-Host "⠀⠀⠀⠀⠀⠀⠀⠀✧⠀⠀⠀⠀⠀⋆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀"
-    Write-Host "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀✦⠀⠀⠀⠀⠀⠀✧⠀⠀⠀⠀⠀⠀"
-    Write-Host "⠀⠀⠀⠀✦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⋆⠀⠀⠀⠀⠀⠀"
-    Write-Host "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⋆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀✦⠀⠀⠀"
-    Write-Host " ⠀⠀⠀⠀⠀⠀✧⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀✦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀"
-    Write-Host "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⋆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀✧⠀⠀"
-    Write-Host "⠀⠀⠀⠀⠀⠀⠀⠀⠀✧⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀✦⠀⠀"
-    Write-Host " ⠀⠀⠀⠀⋆⠀⠀⠀⠀⠀⠀⠀⠀⠀✦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀"
-    Write-Host "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀✧⠀⠀⠀⠀⋆⠀⠀⠀⠀⠀⠀⠀⠀⠀"
-    Write-Host "⠀⠀ ⠀✦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀✧⠀⠀⠀⠀"
-    Write-Host "⠀⠀⠀⠀⋆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀✦⠀⠀"
-    Write-Host ""
-    # STARS wordmark
+    
     Write-Host "${White}${Grey} ███████╗████████╗ █████╗ ██████╗ ███████╗ ${Reset}"
     Write-Host "${White}${Grey} ██╔════╝╚══██╔══╝██╔══██╗██╔══██╗██╔════╝ ${Reset}"
     Write-Host "${White}${Grey} ███████╗   ██║   ███████║██████╔╝███████╗ ${Reset}"
@@ -423,7 +397,6 @@ function Show-Banner {
     Write-Host ""
 }
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 Show-Banner
 
 $ssFolder   = Get-NextSSFolder
@@ -433,7 +406,6 @@ Write-Host "  ${White}Output folder  ${Gray}$ssFolder${Reset}"
 Write-Host "  ${Gray}Total tools    ${White}$totalTools${Reset} ${Gray}across $($Groups.Count) groups${Reset}"
 Write-Host ""
 
-# ── Download mode prompt ──────────────────────────────────────────────────────
 Write-Host "  ${White}Download mode:${Reset}"
 Write-Host ""
 Write-Host "    ${Grey}[A]${Gray}  All tools ${Gray}($totalTools files)${Reset}"
@@ -479,7 +451,6 @@ if ($mode -eq 'A') {
     exit 0
 }
 
-# ── Confirmation ──────────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "  ${White}Selected groups:${Reset}"
 Write-Host ""
@@ -499,7 +470,6 @@ if ($confirm -ne 'Y') {
     exit 0
 }
 
-# ── Setup output folder + AV exclusion ───────────────────────────────────────
 Write-Host ""
 Write-Host "  ${White}Creating ${Grey}$ssFolder${Orange}...${Reset}" -NoNewline
 $null = New-Item -ItemType Directory -Path $ssFolder -Force
@@ -517,7 +487,6 @@ if (-not (Get-Command -Name 'Add-MpPreference' -ErrorAction SilentlyContinue)) {
     }
 }
 
-# ── Download (one group after the other, files inside a group all at once) ────
 $failed = New-Object 'System.Collections.Generic.List[string]'
 
 foreach ($groupName in $selectedNames) {
@@ -535,7 +504,6 @@ foreach ($groupName in $selectedNames) {
 $HttpClient.Dispose()
 $HttpHandler.Dispose()
 
-# ── Rename ToolsDownloader++ ───────────────────────────────────────────────────
 $toolsDownloader = Get-ChildItem -Path $ssFolder `
     -Recurse `
     -File `
@@ -563,7 +531,6 @@ if ($toolsDownloader) {
     }
 }
 
-# ── Summary ───────────────────────────────────────────────────────────────────
 $succeeded = $totalSelected - $failed.Count
 
 Write-Host ""
